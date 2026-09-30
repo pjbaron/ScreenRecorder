@@ -1,0 +1,10 @@
+__pycache__/
+build/
+dist/
+logs/
+*.spec
+*.mkv
+*.wav
+*.mp4
+ffmpeg.exe
+ffprobe.exe
