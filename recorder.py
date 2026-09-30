@@ -8,6 +8,7 @@ encoded to AAC when recording stops. Video is copied, not re-encoded, at that st
 import ctypes
 import ctypes.wintypes as wt
 import datetime
+import json
 import os
 import queue
 import re
@@ -18,6 +19,7 @@ import threading
 import time
 import tkinter as tk
 import wave
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tkinter import filedialog, messagebox, ttk
 
 import pyaudiowpatch as pyaudio
@@ -25,6 +27,7 @@ import pyaudiowpatch as pyaudio
 HOTKEY_MOD = 0x0002 | 0x0001 | 0x4000  # MOD_CONTROL | MOD_ALT | MOD_NOREPEAT
 HOTKEY_VK = 0x52  # R  -> Ctrl+Alt+R
 HOTKEY_TEXT = "Ctrl+Alt+R"
+CONTROL_PORT = 8765  # local control API, 127.0.0.1 only; override with --port N
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Videos", "Captures")
 APP_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(APP_DIR, "logs")
@@ -382,12 +385,131 @@ def start_hotkey_thread(q):
     threading.Thread(target=run, daemon=True).start()
 
 
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+CONFIG_KEYS = ("display", "fps", "quality", "system_audio", "system_device", "mic", "mic_device",
+               "mic_gain_db", "folder")
+FPS_VALUES = (30, 60)
+GAIN_VALUES = (0, 6, 12, 18, 24, 30)
+QUALITY_VALUES = ("standard", "high")
+
+
+def start_control_server(app, port):
+    """JSON-over-HTTP control API on 127.0.0.1. All app state is touched on the Tk thread via app.on_ui."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def send_json(self, code, obj):
+            body = json.dumps(obj, indent=1).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def guard(self):
+            # A web page in a browser must not be able to drive the recorder: browsers always send Origin
+            # on cross-site requests, and DNS rebinding changes the Host header.
+            if self.headers.get("Origin"):
+                raise ApiError(403, "requests with an Origin header are refused")
+            if self.headers.get("Host") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+                raise ApiError(403, f"unexpected Host header {self.headers.get('Host')!r}")
+
+        def body(self):
+            if "application/json" not in (self.headers.get("Content-Type") or ""):
+                raise ApiError(415, "POST bodies must be Content-Type: application/json")
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}"
+            try:
+                d = json.loads(raw)
+            except ValueError as e:
+                raise ApiError(400, f"invalid JSON: {e}")
+            if not isinstance(d, dict):
+                raise ApiError(400, "body must be a JSON object")
+            return d
+
+        def dispatch(self, method):
+            try:
+                self.guard()
+                route = (method, self.path)
+                if route == ("GET", "/status"):
+                    return self.send_json(200, app.on_ui(app.api_status))
+                if route == ("GET", "/devices"):
+                    return self.send_json(200, app.on_ui(app.api_devices))
+                if route == ("GET", "/config"):
+                    return self.send_json(200, app.on_ui(app.api_config))
+                if route == ("POST", "/config"):
+                    d = self.body()
+                    return self.send_json(200, app.on_ui(lambda: app.api_set_config(d)))
+                if route == ("POST", "/start"):
+                    d = self.body()
+
+                    def begin():
+                        if d:
+                            app.api_set_config(d)
+                        app.api_start()
+
+                    app.on_ui(begin)
+                    if not wait_until(lambda: app.state != "starting", 180):
+                        raise ApiError(504, "still starting after 180 s; poll /status")
+                    if app.state != "recording":
+                        raise ApiError(500, app.last_error or "start failed, no error recorded")
+                    return self.send_json(200, app.on_ui(app.api_status))
+                if route == ("POST", "/stop"):
+                    self.body()
+                    app.on_ui(app.api_stop)
+                    if not wait_until(lambda: app.state != "finalizing", 900):
+                        return self.send_json(202, {"done": False, "note": "still finalizing; poll /status"})
+                    if app.last_error:
+                        raise ApiError(500, app.last_error)
+                    return self.send_json(200, {"done": True, "file": app.last_file})
+                if route == ("POST", "/quit"):
+                    self.body()
+                    app.on_ui(app.api_quit)
+                    return self.send_json(200, {"quitting": True})
+                raise ApiError(404, f"no route {method} {self.path}")
+            except ApiError as e:
+                self.send_json(e.status, {"error": str(e)})
+            except Exception as e:
+                self.send_json(500, {"error": f"{type(e).__name__}: {e}"})
+
+        def do_GET(self):
+            self.dispatch("GET")
+
+        def do_POST(self):
+            self.dispatch("POST")
+
+    def wait_until(pred, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            if pred():
+                return True
+            time.sleep(0.1)
+        return False
+
+    ThreadingHTTPServer.daemon_threads = True
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        app.q.put(("control_error", f"port {port}: {e}"))
+        return None
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 class App:
-    def __init__(self, root):
+    def __init__(self, root, port):
         self.root = root
         self.q = queue.Queue()
         self.session = None
         self.state = "idle"  # idle | starting | recording | finalizing
+        self.last_file = None
+        self.last_error = None
         root.title("Screen Recorder")
         root.resizable(False, False)
 
@@ -453,6 +575,7 @@ class App:
         ttk.Label(f, textvariable=self.status, wraplength=470, justify="left").grid(row=r, column=0, columnspan=3, sticky="w")
 
         start_hotkey_thread(self.q)
+        self.control = start_control_server(self, port)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll()
 
@@ -477,22 +600,125 @@ class App:
         return cfg
 
     def toggle(self):
-        if self.state == "idle":
-            try:
-                cfg = self.config()
-            except Exception as e:
-                messagebox.showerror("Screen Recorder", str(e))
-                return
-            self.state = "starting"
-            self.btn.state(["disabled"])
-            self.status.set("Starting...")
-            self.session = Session(cfg)
-            self.bg(self.session.start, "started")
-        elif self.state == "recording":
-            self.state = "finalizing"
-            self.btn.state(["disabled"])
-            self.status.set("Finalizing (mixing audio, writing MP4)...")
-            self.bg(self.session.stop, "stopped")
+        """GUI button and hotkey. Errors are shown in a dialog."""
+        try:
+            if self.state == "idle":
+                self.api_start()
+            elif self.state == "recording":
+                self.api_stop()
+        except Exception as e:
+            self.status.set("Error")
+            messagebox.showerror("Screen Recorder", str(e))
+
+    def api_start(self):
+        if self.state != "idle":
+            raise ApiError(409, f"cannot start while state is {self.state}")
+        cfg = self.config()
+        session = Session(cfg)
+        self.last_error = None
+        self.state = "starting"
+        self.btn.state(["disabled"])
+        self.status.set("Starting...")
+        self.session = session
+        self.bg(session.start, "started")
+
+    def api_stop(self):
+        if self.state != "recording":
+            raise ApiError(409, f"cannot stop while state is {self.state}")
+        self.last_error = None
+        self.state = "finalizing"
+        self.btn.state(["disabled"])
+        self.status.set("Finalizing (mixing audio, writing MP4)...")
+        self.bg(self.session.stop, "stopped")
+
+    def api_quit(self):
+        if self.state != "idle":
+            raise ApiError(409, f"cannot quit while state is {self.state}")
+        self.root.after(200, self.root.destroy)
+
+    def api_config(self):
+        idx, _, _ = self.outputs[self.disp.current()]
+        return {"display": idx, "fps": int(self.fps.get()), "quality": QUALITY_VALUES[self.quality.current()],
+                "system_audio": self.sys_on.get(), "system_device": self.sys_dev.get(),
+                "mic": self.mic_on.get(), "mic_device": self.mic_dev.get(),
+                "mic_gain_db": int(self.mic_gain.get()), "folder": self.folder.get()}
+
+    def api_set_config(self, d):
+        if self.state != "idle":
+            raise ApiError(409, f"cannot change settings while state is {self.state}")
+        unknown = sorted(set(d) - set(CONFIG_KEYS))
+        if unknown:
+            raise ApiError(400, f"unknown keys {unknown}; valid keys are {list(CONFIG_KEYS)}")
+
+        def check(key, allowed):
+            v = d[key]
+            # bool is an int subclass in Python: keep True from matching 1 and 1 from matching True.
+            if not any(v == a and type(v) is type(a) for a in allowed):
+                raise ApiError(400, f"{key}: {v!r} is not one of {list(allowed)}")
+
+        if "display" in d:
+            check("display", [i for i, _, _ in self.outputs])
+        if "fps" in d:
+            check("fps", list(FPS_VALUES))
+        if "quality" in d:
+            check("quality", list(QUALITY_VALUES))
+        for k in ("system_audio", "mic"):
+            if k in d:
+                check(k, [True, False])
+        if "system_device" in d:
+            check("system_device", [x["name"] for x in self.loopbacks])
+        if "mic_device" in d:
+            check("mic_device", [x["name"] for x in self.mics])
+        if "mic_gain_db" in d:
+            check("mic_gain_db", list(GAIN_VALUES))
+        if "folder" in d and not (isinstance(d["folder"], str) and d["folder"].strip()):
+            raise ApiError(400, "folder: must be a non-empty string")
+
+        if "display" in d:
+            self.disp.current([i for i, _, _ in self.outputs].index(d["display"]))
+        if "fps" in d:
+            self.fps.set(str(d["fps"]))
+        if "quality" in d:
+            self.quality.current(QUALITY_VALUES.index(d["quality"]))
+        if "system_audio" in d:
+            self.sys_on.set(d["system_audio"])
+        if "system_device" in d:
+            self.sys_dev.set(d["system_device"])
+        if "mic" in d:
+            self.mic_on.set(d["mic"])
+        if "mic_device" in d:
+            self.mic_dev.set(d["mic_device"])
+        if "mic_gain_db" in d:
+            self.mic_gain.set(str(d["mic_gain_db"]))
+        if "folder" in d:
+            self.folder.set(d["folder"])
+        return self.api_config()
+
+    def api_status(self):
+        d = {"state": self.state, "encoder": self.encoder, "hotkey": HOTKEY_TEXT, "status_text": self.status.get(),
+             "control_port": self.control.server_address[1] if self.control else None,
+             "config": self.api_config(), "last_file": self.last_file, "last_error": self.last_error}
+        if self.state in ("recording", "finalizing") and self.session:
+            d["current_file"] = self.session.final
+        if self.state == "recording" and self.session.started:
+            d["elapsed_s"] = round(time.perf_counter() - self.session.started, 1)
+            d["video_mb"] = round(self.session.video_size() / 1e6, 1)
+        return d
+
+    def api_devices(self):
+        return {"displays": [{"display": i, "width": w, "height": h} for i, w, h in self.outputs],
+                "fps": list(FPS_VALUES), "quality": list(QUALITY_VALUES), "mic_gain_db": list(GAIN_VALUES),
+                "system_devices": [x["name"] for x in self.loopbacks], "mic_devices": [x["name"] for x in self.mics]}
+
+    def on_ui(self, fn):
+        """Run fn on the Tk thread (Tk is not thread-safe) and return its result or raise its exception."""
+        done, box = threading.Event(), {}
+        self.q.put(("call", (fn, done, box)))
+        if not done.wait(30):
+            raise ApiError(503, "UI thread did not respond within 30 s")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
 
     def bg(self, fn, tag):
         def run():
@@ -503,28 +729,40 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def poll(self):
+        dialogs = []
         try:
             while True:
                 tag, val = self.q.get_nowait()
-                if tag == "toggle":
+                if tag == "call":
+                    fn, done, box = val
+                    try:
+                        box["value"] = fn()
+                    except Exception as e:
+                        box["error"] = e
+                    done.set()
+                elif tag == "toggle":
                     self.toggle()
                 elif tag == "hotkey_error":
                     self.status.set(f"Could not register {HOTKEY_TEXT} (already in use). Use the button.")
+                elif tag == "control_error":
+                    self.status.set(f"Control API disabled, could not listen on {val}")
                 elif tag == "started":
                     self.state = "recording"
                     self.btn.config(text=f"Stop ({HOTKEY_TEXT})")
                     self.btn.state(["!disabled"])
                 elif tag == "stopped":
-                    self.state = "idle"
-                    self.btn.config(text=f"Start ({HOTKEY_TEXT})")
-                    self.btn.state(["!disabled"])
+                    self.last_file = val
                     self.status.set(f"Saved: {val}")
-                elif tag == "error":
                     self.state = "idle"
                     self.btn.config(text=f"Start ({HOTKEY_TEXT})")
                     self.btn.state(["!disabled"])
+                elif tag == "error":
+                    self.last_error = str(val)
                     self.status.set("Error")
-                    messagebox.showerror("Screen Recorder", str(val))
+                    self.state = "idle"
+                    self.btn.config(text=f"Start ({HOTKEY_TEXT})")
+                    self.btn.state(["!disabled"])
+                    dialogs.append(str(val))
         except queue.Empty:
             pass
         if self.state == "recording":
@@ -536,7 +774,10 @@ class App:
                 el = int(time.perf_counter() - self.session.started)
                 mb = self.session.video_size() / 1e6
                 self.status.set(f"Recording {el // 3600:02d}:{el // 60 % 60:02d}:{el % 60:02d}   video {mb:.0f} MB")
-        self.root.after(250, self.poll)
+        self.root.after(100, self.poll)
+        # Modal dialogs run a nested event loop, so show them only after poll is rescheduled.
+        for msg in dialogs:
+            messagebox.showerror("Screen Recorder", msg)
 
     def close(self):
         if self.state in ("recording", "starting", "finalizing"):
@@ -548,8 +789,11 @@ class App:
 def main():
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
     ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), BELOW_NORMAL)
+    port = CONTROL_PORT
+    if "--port" in sys.argv:
+        port = int(sys.argv[sys.argv.index("--port") + 1])
     root = tk.Tk()
-    App(root)
+    App(root, port)
     root.mainloop()
 
 

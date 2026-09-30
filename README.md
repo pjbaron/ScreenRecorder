@@ -73,6 +73,26 @@ While recording, the raw video is written to `Recording ....video.mkv` beside th
 
 The hotkey is set by `HOTKEY_MOD` and `HOTKEY_VK` at the top of `recorder.py`. If Ctrl+Alt+R is used by another program, the status line says so and the button still works.
 
+## Remote control (for scripts and Claude Code)
+
+The app listens on `127.0.0.1:8765` (local machine only; change with `python recorder.py --port N`). `ctl.py` is a stdlib-only client for it:
+
+```
+python ctl.py launch                  start the app if needed, wait until it answers
+python ctl.py status                  state, settings, last file, last error, elapsed time while recording
+python ctl.py devices                 valid values for every setting
+python ctl.py config [key=value ...]  show or change settings (idle only)
+python ctl.py start [key=value ...]   apply settings, start, return once recording
+python ctl.py stop                    return once the MP4 is written; prints its path
+python ctl.py quit                    close the app (idle only)
+```
+
+Settings keys: `display` (index from `devices`), `fps` (30 or 60), `quality` (`standard` or `high`), `system_audio` (true/false), `system_device`, `mic` (true/false), `mic_device`, `mic_gain_db` (0, 6, 12, 18, 24, 30), `folder`. Device names must match `devices` exactly. Invalid values are rejected with an error, nothing is silently corrected.
+
+Raw API: `GET /status /devices /config`, `POST /config /start /stop /quit`. POST bodies are JSON objects sent with `Content-Type: application/json`. Errors return `{"error": "..."}` with HTTP 4xx/5xx. Requests carrying an `Origin` header, or a `Host` other than `127.0.0.1:PORT` or `localhost:PORT`, are refused so web pages cannot drive the recorder.
+
+Errors from remote-started recordings are returned in the reply and kept in `last_error`; the GUI also shows its usual dialog, which does not block the API. The `/stop` call waits up to 900 s and returns HTTP 202 if the file is still being written. If port 8765 is taken, the status line says so and the API is disabled.
+
 ## How it works
 
 - `ddagrab` captures the desktop into GPU memory; the encoder reads those frames directly.
