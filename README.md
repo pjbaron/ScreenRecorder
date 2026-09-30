@@ -64,6 +64,7 @@ The result is `dist\ScreenRecorder\ScreenRecorder.exe`. Do not commit `dist`, `b
 | Quality | Standard is about 9 Mbps at 1080p60. High is 1.5 times that. |
 | System audio | Records what plays on the chosen output device (loopback). Pick the device you actually listen on. |
 | Microphone | Optional. Mixed into the same audio track as system audio. |
+| Mic gain (dB) | Boost applied to the mic before mixing (0 to 30). Use 12 to 24 for quiet mics, such as many Bluetooth headsets. A limiter prevents clipping. |
 | Save to | Output folder. Default `Videos\Captures`. |
 
 Press Start or Ctrl+Alt+R. Press Stop or Ctrl+Alt+R again to finish. After stopping, it takes a few seconds to mix audio and write the final MP4 (the video is copied, not re-encoded). Files are named `Recording YYYY-MM-DD HH-MM-SS.mp4`.
@@ -88,6 +89,7 @@ Logs for the last recording are in the `logs` folder next to the app: `record.lo
 - `Unanticipated host error (-9999)` on start: an audio device could not be opened. Close programs that hold the device in exclusive mode, and re-select the device in the dropdown.
 - Black video for a specific game: some exclusive-fullscreen or protected-content windows cannot be duplicated. Switch the game to borderless windowed.
 - Microphone silent: see the privacy setting above.
+- Microphone very quiet: raise Mic gain. Check levels in Settings > System > Sound > Input first.
 - Video and audio drift over a long recording: report it with the `mux.log` file.
 
 ## Limitations

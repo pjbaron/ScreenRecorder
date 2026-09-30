@@ -339,11 +339,17 @@ class Session:
             # Video starts recording before the first-frame signal reaches us, so the audio files are
             # shorter than the video by the start lag. Delay audio by that difference.
             lag_ms = max(0, int((self._video_duration() - self._audio_duration()) * 1000))
-            norm = f"aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={lag_ms}:all=1"
+            norm = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+            parts, labels = [], []
+            for i, t in enumerate(self.tracks, start=1):
+                gain = f",volume={self.cfg['mic_gain_db']}dB" if t.path.endswith(".mic.wav") else ""
+                parts.append(f"[{i}:a]{norm}{gain},adelay={lag_ms}:all=1[a{i}]")
+                labels.append(f"[a{i}]")
             if len(self.tracks) == 1:
-                fg = f"[1:a]{norm}[a]"
+                parts.append(f"{labels[0]}alimiter=limit=0.95[a]")
             else:
-                fg = f"[1:a]{norm}[a1];[2:a]{norm}[a2];[a1][a2]amix=inputs=2:duration=longest:normalize=0[a]"
+                parts.append(f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:normalize=0,alimiter=limit=0.95[a]")
+            fg = ";".join(parts)
             cmd += ["-filter_complex", fg, "-map", "0:v", "-map", "[a]", "-c:v", "copy",
                     "-c:a", "aac", "-b:a", f"{AUDIO_KBPS}k"]
         cmd += ["-movflags", "+faststart", self.final]
@@ -427,6 +433,12 @@ class App:
         self.mic_dev.grid(row=r, column=1, columnspan=2, sticky="w", pady=2)
 
         r += 1
+        ttk.Label(f, text="Mic gain (dB)").grid(row=r, column=0, sticky="w")
+        self.mic_gain = ttk.Combobox(f, state="readonly", width=8, values=["0", "6", "12", "18", "24", "30"])
+        self.mic_gain.set("0")
+        self.mic_gain.grid(row=r, column=1, sticky="w", pady=2)
+
+        r += 1
         ttk.Label(f, text="Save to").grid(row=r, column=0, sticky="w")
         self.folder = tk.StringVar(value=DEFAULT_DIR)
         ttk.Entry(f, textvariable=self.folder, width=40).grid(row=r, column=1, sticky="w", pady=2)
@@ -454,7 +466,8 @@ class App:
         fps = int(self.fps.get())
         cfg = {"encoder": self.encoder, "output_idx": idx, "fps": fps, "folder": self.folder.get(),
                "bitrate": target_bitrate(w, h, fps, self.quality.current() == 1),
-               "sys_dev": None, "mic_dev": None}
+               "sys_dev": None, "mic_dev": None,
+               "mic_gain_db": int(self.mic_gain.get())}
         if self.sys_on.get():
             cfg["sys_dev"] = next(d for d in self.loopbacks if d["name"] == self.sys_dev.get())
         if self.mic_on.get():
